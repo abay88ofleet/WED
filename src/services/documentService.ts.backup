@@ -1,0 +1,309 @@
+import { supabase } from '../lib/supabase';
+import { generateFileHash, checkDuplicateFile, extractMetadataAndTags } from './uploadService';
+import { createAuditLog, AUDIT_ACTIONS } from './auditService';
+
+export interface UploadDocumentParams {
+  file: File;
+  categoryId: string;
+  tags: string[];
+  description?: string;
+  isSoftCopyTemplate?: boolean;
+}
+
+export interface DocumentMetadata {
+  title: string;
+  description: string;
+  fileName: string;
+  fileType: string;
+  fileSize: number;
+  filePath: string;
+  fileHash: string;
+  categoryId: string;
+  tags: string[];
+  thumbnailUrl?: string;
+  ocrText?: string;
+  metadata: Record<string, any>;
+}
+
+export async function uploadDocument(params: UploadDocumentParams): Promise<{ success: boolean; documentId?: string; error?: string; existingDocId?: string }> {
+  try {
+    const { file, categoryId, tags, description = '', isSoftCopyTemplate = false } = params;
+
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) {
+      return { success: false, error: 'User not authenticated' };
+    }
+
+    const fileHash = await generateFileHash(file);
+    const duplicateCheck = await checkDuplicateFile(fileHash, user.id);
+
+    if (duplicateCheck.isDuplicate) {
+      return {
+        success: false,
+        error: `Document with identical content already exists as "${duplicateCheck.fileName}". Use a different name to create a copy.`,
+        existingDocId: duplicateCheck.existingDocId
+      };
+    }
+
+    const filePath = `${user.id}/${fileHash}-${file.name}`;
+
+    const { error: uploadError } = await supabase.storage
+      .from('documents')
+      .upload(filePath, file, {
+        cacheControl: '3600',
+        upsert: false,
+      });
+
+    if (uploadError) {
+      return { success: false, error: uploadError.message };
+    }
+
+    const { metadata: extractedMetadata, ocrText } = await extractMetadataAndTags(file);
+
+    const title = file.name.replace(/\.[^/.]+$/, '');
+
+    const { data: document, error: insertError } = await supabase
+      .from('documents')
+      .insert({
+        title,
+        description,
+        file_name: file.name,
+        file_type: file.type || 'application/octet-stream',
+        file_size: file.size,
+        file_path: filePath,
+        file_hash: fileHash,
+        category_id: categoryId || null,
+        tags,
+        uploaded_by: user.id,
+        ocr_text: ocrText,
+        metadata: extractedMetadata || {},
+        is_soft_copy_template: isSoftCopyTemplate,
+        is_downloadable_only: isSoftCopyTemplate,
+      })
+      .select('id')
+      .single();
+
+    if (insertError) {
+      await supabase.storage.from('documents').remove([filePath]);
+      return { success: false, error: insertError.message };
+    }
+
+    await createAuditLog({
+      action: AUDIT_ACTIONS.DOCUMENT_UPLOAD,
+      resourceType: 'document',
+      resourceId: document.id,
+      metadata: {
+        fileName: file.name,
+        fileSize: file.size,
+        categoryId,
+        tags,
+      },
+    });
+
+    return { success: true, documentId: document.id };
+  } catch (error) {
+    console.error('Error uploading document:', error);
+    return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+  }
+}
+
+export async function getDocuments() {
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) {
+    return { data: null, error: 'User not authenticated' };
+  }
+
+  const { data, error } = await supabase
+    .from('documents')
+    .select(`
+      *,
+      category:categories(*)
+    `)
+    .eq('uploaded_by', user.id)
+    .order('uploaded_at', { ascending: false });
+
+  return { data, error };
+}
+
+export async function getCategories() {
+  try {
+    const { data, error } = await supabase
+      .from('categories')
+      .select('*');
+
+    if (error) {
+      console.error('Error fetching categories:', error);
+      return { data: null, error: error.message };
+    }
+
+    // Sort in memory to handle multiple sort criteria
+    const sortedData = data?.sort((a, b) => {
+      // First sort by is_pinned (pinned items first)
+      if (a.is_pinned !== b.is_pinned) {
+        return b.is_pinned ? 1 : -1;
+      }
+      // Then by sort_order
+      if (a.sort_order !== b.sort_order) {
+        return (a.sort_order || 0) - (b.sort_order || 0);
+      }
+      // Finally by name
+      return (a.name || '').localeCompare(b.name || '');
+    });
+
+    return { data: sortedData || [], error: null };
+  } catch (error) {
+    console.error('Exception in getCategories:', error);
+    return { data: null, error: error instanceof Error ? error.message : 'Unknown error' };
+  }
+}
+
+export async function deleteDocument(documentId: string) {
+  const { data: document } = await supabase
+    .from('documents')
+    .select('file_path, file_name')
+    .eq('id', documentId)
+    .single();
+
+  if (document?.file_path) {
+    await supabase.storage.from('documents').remove([document.file_path]);
+  }
+
+  const { error } = await supabase
+    .from('documents')
+    .delete()
+    .eq('id', documentId);
+
+  if (!error) {
+    await createAuditLog({
+      action: AUDIT_ACTIONS.DOCUMENT_DELETE,
+      resourceType: 'document',
+      resourceId: documentId,
+      metadata: {
+        fileName: document?.file_name,
+      },
+    });
+  }
+
+  return { error };
+}
+
+export async function incrementViewCount(documentId: string) {
+  const { error } = await supabase.rpc('increment_view_count', {
+    document_id: documentId,
+  });
+
+  return { error };
+}
+
+export async function incrementDownloadCount(documentId: string) {
+  const { error } = await supabase.rpc('increment_download_count', {
+    document_id: documentId,
+  });
+
+  return { error };
+}
+
+export async function toggleFavorite(documentId: string, isFavorite: boolean) {
+  const { error } = await supabase
+    .from('documents')
+    .update({ is_favorite: isFavorite })
+    .eq('id', documentId);
+
+  return { error };
+}
+
+export async function getDocumentUrl(filePath: string): Promise<string> {
+  const { data, error } = await supabase.storage
+    .from('documents')
+    .createSignedUrl(filePath, 3600);
+
+  if (error || !data) {
+    console.error('Error creating signed URL:', error);
+    const { data: publicData } = supabase.storage
+      .from('documents')
+      .getPublicUrl(filePath);
+    return publicData.publicUrl;
+  }
+
+  return data.signedUrl;
+}
+
+export async function downloadDocument(filePath: string, fileName: string) {
+  const { data, error } = await supabase.storage
+    .from('documents')
+    .download(filePath);
+
+  if (error || !data) {
+    throw new Error(error?.message || 'Failed to download document');
+  }
+
+  const url = URL.createObjectURL(data);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = fileName;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+export async function uploadDocumentCopy(params: UploadDocumentParams & { newFileName: string }): Promise<{ success: boolean; documentId?: string; error?: string }> {
+  try {
+    const { file, categoryId, tags, description = '', newFileName, isSoftCopyTemplate = false } = params;
+
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) {
+      return { success: false, error: 'User not authenticated' };
+    }
+
+    const fileHash = await generateFileHash(file);
+    const timestamp = Date.now();
+    const filePath = `${user.id}/${fileHash}-${timestamp}-${newFileName}`;
+
+    const { error: uploadError } = await supabase.storage
+      .from('documents')
+      .upload(filePath, file, {
+        cacheControl: '3600',
+        upsert: false,
+      });
+
+    if (uploadError) {
+      return { success: false, error: uploadError.message };
+    }
+
+    const { metadata: extractedMetadata, ocrText } = await extractMetadataAndTags(file);
+
+    const title = newFileName.replace(/\.[^/.]+$/, '');
+
+    const { data: document, error: insertError } = await supabase
+      .from('documents')
+      .insert({
+        title,
+        description,
+        file_name: newFileName,
+        file_type: file.type || 'application/octet-stream',
+        file_size: file.size,
+        file_path: filePath,
+        file_hash: fileHash,
+        category_id: categoryId || null,
+        tags,
+        uploaded_by: user.id,
+        ocr_text: ocrText,
+        metadata: extractedMetadata || {},
+        is_soft_copy_template: isSoftCopyTemplate,
+        is_downloadable_only: isSoftCopyTemplate,
+      })
+      .select('id')
+      .single();
+
+    if (insertError) {
+      await supabase.storage.from('documents').remove([filePath]);
+      return { success: false, error: insertError.message };
+    }
+
+    return { success: true, documentId: document.id };
+  } catch (error) {
+    console.error('Error uploading document copy:', error);
+    return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+  }
+}
