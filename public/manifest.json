@@ -1,0 +1,25 @@
+{
+  "name": "Document Archive Management",
+  "short_name": "DocArchive",
+  "description": "Secure document archive management system for organizing, storing, and managing your digital documents",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#1e40af",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "/vite.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": [
+    "productivity",
+    "business"
+  ],
+  "lang": "en",
+  "dir": "ltr"
+}
+
